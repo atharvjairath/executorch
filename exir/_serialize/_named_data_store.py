@@ -13,20 +13,23 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from executorch.exir._serialize._cord import CordBuffer, FileBackedData
 from executorch.exir._serialize.data_serializer import DataEntry
+from executorch.exir.tensor import dim_order_from_stride
 from executorch.exir.tensor_layout import TensorLayout
 
 
 def _tensor_to_bytes(tensor: torch.Tensor) -> bytes:
-    """Convert tensor to bytes using the fastest method available.
+    """Convert a tensor to its bytes, in the tensor's own memory layout.
 
-    Uses numpy().tobytes() which is faster than bytes(untyped_storage())
-    for C-contiguous tensors. Falls back to untyped_storage() for
-    non-contiguous tensors (e.g., channels_last) to preserve memory layout.
+    The layout matters because the dim_order recorded alongside the data
+    describes the physical order, not the logical one.
     """
     if not tensor.is_contiguous():
-        # For non-C-contiguous tensors (e.g., channels_last), use untyped_storage
-        # to preserve the actual memory layout
-        return bytes(tensor.untyped_storage())
+        # Permuting a tensor that is contiguous in some other memory format,
+        # such as channels_last, into its physical order makes it C-contiguous,
+        # so numpy reads the bytes in memory layout. Reading the storage
+        # directly would be wrong here: a view holds fewer bytes than the
+        # storage it points into, and may not start at its beginning.
+        tensor = tensor.permute(dim_order_from_stride(tensor.stride()))
     if tensor.dtype == torch.bfloat16:
         # BFloat16 is not supported by numpy, extract raw bytes via view
         return tensor.view(torch.uint16).numpy().tobytes()

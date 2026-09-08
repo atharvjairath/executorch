@@ -16,7 +16,10 @@ from typing import Any, cast
 import torch
 
 from executorch.exir._serialize._cord import FileBackedData
-from executorch.exir._serialize._named_data_store import NamedDataStore
+from executorch.exir._serialize._named_data_store import (
+    _tensor_to_bytes,
+    NamedDataStore,
+)
 from executorch.exir._serialize.data_serializer import DataEntry
 from executorch.exir.scalar_type import ScalarType
 from executorch.exir.tensor_layout import TensorLayout
@@ -434,3 +437,73 @@ class TestNamedDataStore(unittest.TestCase):
                 self.assertIs(store3.buffers[0], file2)
 
             self.assertEqual([], os.listdir(directory))
+
+
+class TestTensorToBytes(unittest.TestCase):
+    def test_c_contiguous(self) -> None:
+        tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        self.assertEqual(_tensor_to_bytes(tensor), tensor.numpy().tobytes())
+
+    def test_bfloat16(self) -> None:
+        tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3).to(torch.bfloat16)
+        self.assertEqual(
+            _tensor_to_bytes(tensor), tensor.view(torch.uint16).numpy().tobytes()
+        )
+
+    def test_channels_last_is_in_memory_order(self) -> None:
+        # The bytes must follow the physical layout, which is what the
+        # dim_order stored alongside them describes, not the logical one.
+        tensor = (
+            torch.arange(24, dtype=torch.float32)
+            .reshape(1, 2, 3, 4)
+            .to(memory_format=torch.channels_last)
+        )
+        self.assertFalse(tensor.is_contiguous())
+        self.assertEqual(_tensor_to_bytes(tensor), bytes(tensor.untyped_storage()))
+
+    def test_channels_last_view_holds_only_its_own_bytes(self) -> None:
+        # A slice of a channels-last tensor is contiguous in that memory
+        # format, so nothing upstream rejects it, but its storage holds the
+        # whole base tensor. The bytes must be the slice's own.
+        base = (
+            torch.arange(240, dtype=torch.float32)
+            .reshape(4, 3, 4, 5)
+            .to(memory_format=torch.channels_last)
+        )
+        for name, view in (("front", base[0:2]), ("offset", base[2:4])):
+            with self.subTest(name):
+                data = _tensor_to_bytes(view)
+                self.assertEqual(len(data), view.nbytes)
+                # Cloning gives a tensor that owns exactly its own storage, so
+                # its bytes are the reference the view has to match.
+                self.assertEqual(data, _tensor_to_bytes(view.clone()))
+
+    def test_bfloat16_channels_last_view(self) -> None:
+        base = (
+            torch.arange(240, dtype=torch.float32)
+            .reshape(4, 3, 4, 5)
+            .to(torch.bfloat16)
+            .to(memory_format=torch.channels_last)
+        )
+        view = base[2:4]
+        data = _tensor_to_bytes(view)
+        self.assertEqual(len(data), view.nbytes)
+        self.assertEqual(data, _tensor_to_bytes(view.clone()))
+
+    def test_store_round_trips_channels_last_view(self) -> None:
+        base = (
+            torch.arange(240, dtype=torch.float32)
+            .reshape(4, 3, 4, 5)
+            .to(memory_format=torch.channels_last)
+        )
+        view = base[2:4]
+
+        store = NamedDataStore()
+        store.add_named_data("weight", view, external_tag="model")
+        output = store.get_named_data_store_output()
+
+        entry = output.external_data["model"]["weight"]
+        layout = entry.tensor_layout
+        self.assertIsNotNone(layout)
+        self.assertEqual(layout.sizes, list(view.shape))
+        self.assertEqual(len(output.buffers[entry.buffer_index]), view.nbytes)
